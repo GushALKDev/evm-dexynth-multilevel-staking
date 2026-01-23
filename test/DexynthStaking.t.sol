@@ -2,12 +2,12 @@
 pragma solidity ^0.8.7;
 
 import {Test} from "forge-std/Test.sol";
-import {DexynthStakingV1} from "../src/DexynthStaking.sol";
+import {DexynthStakingV2_1} from "../src/DexynthStaking.sol";
 import {DEXYToken} from "../src/DEXY.sol";
 import {RewardToken} from "../src/RewardToken.sol";
 
 contract DexynthStakingTest is Test {
-    DexynthStakingV1 public staking;
+    DexynthStakingV2_1 public staking;
     DEXYToken public dexy;
     RewardToken public rewardToken;
 
@@ -30,15 +30,15 @@ contract DexynthStakingTest is Test {
         rewardToken = new RewardToken();
 
         // Setup Levels (dynamic array)
-        DexynthStakingV1.Level[] memory levels = new DexynthStakingV1.Level[](5);
-        levels[0] = DexynthStakingV1.Level(2592000, 6500000000, 0);
-        levels[1] = DexynthStakingV1.Level(7776000, 8500000000, 0);
-        levels[2] = DexynthStakingV1.Level(15552000, 10000000000, 0);
-        levels[3] = DexynthStakingV1.Level(31536000, 11500000000, 0);
-        levels[4] = DexynthStakingV1.Level(62208000, 13500000000, 0);
+        DexynthStakingV2_1.Level[] memory levels = new DexynthStakingV2_1.Level[](5);
+        levels[0] = DexynthStakingV2_1.Level(2592000, 6500000000, 0);
+        levels[1] = DexynthStakingV2_1.Level(7776000, 8500000000, 0);
+        levels[2] = DexynthStakingV2_1.Level(15552000, 10000000000, 0);
+        levels[3] = DexynthStakingV2_1.Level(31536000, 11500000000, 0);
+        levels[4] = DexynthStakingV2_1.Level(62208000, 13500000000, 0);
 
         // Deploy Staking
-        staking = new DexynthStakingV1(
+        staking = new DexynthStakingV2_1(
             address(dexy),
             address(rewardToken),
             levels,
@@ -80,7 +80,7 @@ contract DexynthStakingTest is Test {
         assertEq(staking.getNumberOfLevels(), 5);
         
         // getLevels now returns Level[] directly
-        DexynthStakingV1.Level[] memory levels = staking.getLevels();
+        DexynthStakingV2_1.Level[] memory levels = staking.getLevels();
         assertEq(levels[0].lockingPeriod, 2592000);
         assertEq(levels[0].boostP, 6500000000);
         assertEq(levels[4].lockingPeriod, 62208000);
@@ -104,7 +104,7 @@ contract DexynthStakingTest is Test {
         assertGt(staking.migrationRequestTime(), 0);
         
         // Try to execute before timelock - should fail
-        vm.expectRevert(DexynthStakingV1.TimelockStillActive.selector);
+        vm.expectRevert(DexynthStakingV2_1.TimelockStillActive.selector);
         staking.executeMigration();
         
         // Wait for timelock (30 days)
@@ -153,20 +153,20 @@ contract DexynthStakingTest is Test {
     function testMigrationFailAlreadyPending() public {
         staking.requestMigration(address(0x999));
         
-        vm.expectRevert(DexynthStakingV1.MigrationAlreadyPending.selector);
+        vm.expectRevert(DexynthStakingV2_1.MigrationAlreadyPending.selector);
         staking.requestMigration(address(0x888));
     }
 
     function testMigrationFailNoRequest() public {
-        vm.expectRevert(DexynthStakingV1.NoMigrationRequested.selector);
+        vm.expectRevert(DexynthStakingV2_1.NoMigrationRequested.selector);
         staking.executeMigration();
         
-        vm.expectRevert(DexynthStakingV1.NoMigrationRequested.selector);
+        vm.expectRevert(DexynthStakingV2_1.NoMigrationRequested.selector);
         staking.cancelMigration();
     }
 
     function testGetLevels() public view {
-        DexynthStakingV1.Level[] memory levelsData = staking.getLevels();
+        DexynthStakingV2_1.Level[] memory levelsData = staking.getLevels();
         // Check a few values - using hardcoded expected values since levels are set in constructor
         assertEq(levelsData[0].lockingPeriod, 2592000);
         assertEq(levelsData[0].boostP, 6500000000);
@@ -282,7 +282,7 @@ contract DexynthStakingTest is Test {
 
     function testLevelTotalStakedUpdates() public {
         // Check initial totalStaked is 0
-        DexynthStakingV1.Level[] memory levelsBefore = staking.getLevels();
+        DexynthStakingV2_1.Level[] memory levelsBefore = staking.getLevels();
         assertEq(levelsBefore[0].totalStaked, 0);
         
         // Stake
@@ -290,7 +290,7 @@ contract DexynthStakingTest is Test {
         staking.stake(1000 ether, 0);
         
         // Check totalStaked increased
-        DexynthStakingV1.Level[] memory levelsAfter = staking.getLevels();
+        DexynthStakingV2_1.Level[] memory levelsAfter = staking.getLevels();
         assertEq(levelsAfter[0].totalStaked, 1000 ether);
         
         // Warp and unstake
@@ -299,7 +299,7 @@ contract DexynthStakingTest is Test {
         staking.unstake(0);
         
         // Check totalStaked decreased
-        DexynthStakingV1.Level[] memory levelsEnd = staking.getLevels();
+        DexynthStakingV2_1.Level[] memory levelsEnd = staking.getLevels();
         assertEq(levelsEnd[0].totalStaked, 0);
     }
 
@@ -339,7 +339,7 @@ contract DexynthStakingTest is Test {
 
     function testUnlockTimeCalculatedFromEpochStart() public {
         uint32 epochDuration = staking.epochDuration();
-        DexynthStakingV1.Level[] memory levels = staking.getLevels();
+        DexynthStakingV2_1.Level[] memory levels = staking.getLevels();
         uint32 lockingPeriod = levels[0].lockingPeriod;
         
         // Get next epoch start
@@ -387,7 +387,7 @@ contract DexynthStakingTest is Test {
         assertEq(balanceUser2Before - balanceUser2After, 1800 ether);
         
         // Verify via Level.totalStaked instead of deprecated mapping
-        DexynthStakingV1.Level[] memory levels = staking.getLevels();
+        DexynthStakingV2_1.Level[] memory levels = staking.getLevels();
         assertGt(levels[0].totalStaked + levels[4].totalStaked, 0);
     }
 
@@ -445,13 +445,13 @@ contract DexynthStakingTest is Test {
 
     function testStakeFailZeroAmount() public {
         vm.prank(user1);
-        vm.expectRevert(DexynthStakingV1.WrongParams.selector);
+        vm.expectRevert(DexynthStakingV2_1.WrongParams.selector);
         staking.stake(0, 0);
     }
 
     function testStakeFailInvalidLevel() public {
         vm.prank(user1);
-        vm.expectRevert(DexynthStakingV1.WrongParams.selector);
+        vm.expectRevert(DexynthStakingV2_1.WrongParams.selector);
         staking.stake(100 ether, 5); // Level 5 does not exist (0-4)
     }
 
@@ -561,7 +561,7 @@ contract DexynthStakingTest is Test {
 
         // Try to unstake immediately
         vm.prank(user1);
-        vm.expectRevert(DexynthStakingV1.StakeStillLocked.selector);
+        vm.expectRevert(DexynthStakingV2_1.StakeStillLocked.selector);
         staking.unstake(0);
     }
 
@@ -573,7 +573,7 @@ contract DexynthStakingTest is Test {
 
         vm.startPrank(user1);
         staking.unstake(0);
-        vm.expectRevert(DexynthStakingV1.AlreadyUnstaked.selector);
+        vm.expectRevert(DexynthStakingV2_1.AlreadyUnstaked.selector);
         staking.unstake(0); // Should fail
         vm.stopPrank();
     }
@@ -677,7 +677,7 @@ contract DexynthStakingTest is Test {
 
         vm.startPrank(user1);
         staking.harvest();
-        vm.expectRevert(DexynthStakingV1.NoRewardsToHarvest.selector);
+        vm.expectRevert(DexynthStakingV2_1.NoRewardsToHarvest.selector);
         staking.harvest(); // Should fail: NoRewardsToHarvest (already harvested)
         vm.stopPrank();
     }
@@ -695,7 +695,7 @@ contract DexynthStakingTest is Test {
         // The contract checks if totalUserRewards == 0 at the end of harvest()
         // and reverts with NoRewardsToHarvest if so.
         
-        vm.expectRevert(DexynthStakingV1.NoRewardsToHarvest.selector);
+        vm.expectRevert(DexynthStakingV2_1.NoRewardsToHarvest.selector);
         staking.harvest(); 
     }
 
@@ -740,7 +740,7 @@ contract DexynthStakingTest is Test {
         staking.stake(_amount, _levelIndex);
         
         // Get locking period from contract
-        DexynthStakingV1.Level[] memory levelsData = staking.getLevels();
+        DexynthStakingV2_1.Level[] memory levelsData = staking.getLevels();
         uint256 lockingPeriod = levelsData[_levelIndex].lockingPeriod;
         
         // Warp to unlock (lockingPeriod + 1 epoch buffer to ensure we are in the next epoch)

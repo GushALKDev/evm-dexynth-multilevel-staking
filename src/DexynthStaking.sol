@@ -13,7 +13,7 @@ import {ReentrancyGuard} from "@openzeppelin/security/ReentrancyGuard.sol";
  * @dev Supports multiple lock periods with boosted rewards.
  *      Uses O(1) reward distribution via accumulators.
  */
-contract DexynthStakingV1 is Ownable, ReentrancyGuard {
+contract DexynthStakingV2_1 is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
 
@@ -24,9 +24,11 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
 
     // Constants addresses
     uint32 public constant MIGRATION_DELAY = 30 days;
+    uint256 private constant ACC_PRECISION = 1e18;
+    uint256 private constant BOOST_PRECISION = 1e10;
 
     // SLOT 0: 18 bytes
-    uint32 public epochDuration;                       // 4 bytes
+    uint32 public immutable epochDuration;             // 4 bytes
     uint32 public migrationRequestTime;                // 4 bytes
     uint40 public lastRewardTime;                      // 5 bytes
     uint40 public rewardEndTime;                       // 5 bytes
@@ -86,7 +88,7 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
     /**
      * @notice Staking level configuration
      * @param lockingPeriod Duration in seconds tokens must be locked
-     * @param boostP Reward multiplier (basis points, 1e10 precision)
+     * @param boostP Reward multiplier (basis points, BOOST_PRECISION precision)
      * @param totalStaked Total DEXY staked in this level globally
      */
     struct Level {
@@ -139,21 +141,21 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
      * @param amount Amount of tokens transferred
      * @param newContractAddress Destination address
      */
-    event RewardTokenMigrationSuccess(uint256 amount, address newContractAddress);
+    event RewardTokenMigrationSuccess(uint256 amount, address indexed newContractAddress);
     
     /**
      * @notice Emitted when DEXY liquidity is migrated
      * @param amount Amount of tokens transferred
      * @param newContractAddress Destination address
      */
-    event DEXYMigrationSuccess(uint256 amount, address newContractAddress);
+    event DEXYMigrationSuccess(uint256 amount, address indexed newContractAddress);
     
     /**
      * @notice Emitted when migration is requested
      * @param newContractAddress Proposed destination address
      * @param executeAfter Timestamp when migration can be executed
      */
-    event MigrationRequested(address newContractAddress, uint40 executeAfter);
+    event MigrationRequested(address indexed newContractAddress, uint40 executeAfter);
     
     /// @notice Emitted when migration is cancelled
     event MigrationCancelled();
@@ -206,8 +208,6 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
         
         _updatePool();
         
-        IERC20(DEXY).safeTransferFrom(msg.sender, address(this), _amount);
-        
         uint64 userStakeIndex = users[msg.sender].stakeIndex;
         uint40 nextEpochStart = _getNextEpochStart();
         uint40 unlockTime = uint40(nextEpochStart + levels[_level].lockingPeriod);
@@ -220,16 +220,19 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
             unlockTime: unlockTime,
             level: _level,
             unstaked: false,
-            rewardDebt: (_amount * accRewardPerShare[_level]) / 1e18
+            rewardDebt: (_amount * accRewardPerShare[_level]) / ACC_PRECISION
         });
         
         // Update level totals (MasterChef pattern)
         levels[_level].totalStaked += _amount.toUint128();
-        totalBoostedStake += (_amount * levels[_level].boostP) / 1e10;
+        _recalculateTotalBoostedStake();
         
         // Update user
         users[msg.sender].totalStakedDexy += _amount.toUint128();
         users[msg.sender].stakeIndex++;
+        
+        // Interactions
+        IERC20(DEXY).safeTransferFrom(msg.sender, address(this), _amount);
         
         emit DEXYStaked(msg.sender, _amount);
     }
@@ -246,29 +249,36 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
         
         _updatePool();
         
-        // Harvest rewards for this stake first
+        // Calculate rewards
+        uint256 pending = 0;
         if (block.timestamp >= s.rewardStartTime) {
             uint256 accReward = accRewardPerShare[s.level];
-            uint256 pending = (uint256(s.stakedDexy) * accReward / 1e18) - s.rewardDebt;
-            if (pending > 0) {
-                users[msg.sender].totalHarvestedRewards += pending.toUint128();
-                IERC20(REWARD_TOKEN).safeTransfer(msg.sender, pending);
-                emit RewardsHarvested(msg.sender, pending);
-            }
+            pending = (uint256(s.stakedDexy) * accReward / ACC_PRECISION) - s.rewardDebt;
         }
         
         uint256 amount = s.stakedDexy;
         uint8 level = s.level;
+
+        // Effects
+        if (pending > 0) {
+            users[msg.sender].totalHarvestedRewards += pending.toUint128();
+        }
         
         // Update level totals (MasterChef pattern)
         levels[level].totalStaked -= amount.toUint128();
-        totalBoostedStake -= (amount * levels[level].boostP) / 1e10;
+        _recalculateTotalBoostedStake();
         
         // Update user
         users[msg.sender].totalStakedDexy -= amount.toUint128();
         
         // Mark stake as unstaked
         s.unstaked = true;
+        
+        // Interactions
+        if (pending > 0) {
+            IERC20(REWARD_TOKEN).safeTransfer(msg.sender, pending);
+            emit RewardsHarvested(msg.sender, pending);
+        }
         
         // Transfer DEXYs back to the user
         IERC20(DEXY).safeTransfer(msg.sender, amount);
@@ -295,7 +305,7 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
      * @return Total rewards harvested
      */
     function _harvestAll(address _user) internal returns (uint256) {
-        uint256 totalPending;
+        uint256 totalPending = 0;
         uint64 stakeCount = users[_user].stakeIndex;
 
         for (uint64 i = 0; i < stakeCount;) {
@@ -303,11 +313,11 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
             
             if (!s.unstaked && block.timestamp >= s.rewardStartTime) {
                 uint256 accReward = accRewardPerShare[s.level];
-                uint256 pending = (uint256(s.stakedDexy) * accReward / 1e18) - s.rewardDebt;
+                uint256 pending = (uint256(s.stakedDexy) * accReward / ACC_PRECISION) - s.rewardDebt;
                 
                 if (pending > 0) {
                     totalPending += pending;
-                    s.rewardDebt = (uint256(s.stakedDexy) * accReward) / 1e18;
+                    s.rewardDebt = (uint256(s.stakedDexy) * accReward) / ACC_PRECISION;
                 }
             }
             unchecked { i++; }
@@ -332,17 +342,19 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
         
         _updatePool();
         
-        IERC20(REWARD_TOKEN).safeTransferFrom(msg.sender, address(this), _amount);
-
         // Calculate remaining rewards from current rate
         uint256 remainingRewards = 0;
         if (rewardEndTime > block.timestamp) {
+            // slither-disable-next-line divide-before-multiply
             remainingRewards = (rewardEndTime - block.timestamp) * rewardRate;
         }
 
         // New rate = (remaining + new) / new duration
         rewardRate = (remainingRewards + _amount) / _duration;
         rewardEndTime = (block.timestamp + _duration).toUint40();
+        
+        // Interactions
+        IERC20(REWARD_TOKEN).safeTransferFrom(msg.sender, address(this), _amount);
     }
 
     // ========== VIEW FUNCTIONS ==========
@@ -372,8 +384,10 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
      */
     function pendingRewards(address _user) external view returns (uint256) {
         // Simulate _updatePool to get current accRewardPerShare
-        uint256[] memory simAccRewardPerShare = new uint256[](levels.length);
-        for (uint8 i = 0; i < levels.length; i++) {
+        // Simulate _updatePool to get current accRewardPerShare
+        uint256 numLevels = levels.length;
+        uint256[] memory simAccRewardPerShare = new uint256[](numLevels);
+        for (uint8 i = 0; i < numLevels; i++) {
             simAccRewardPerShare[i] = accRewardPerShare[i];
         }
         
@@ -386,25 +400,27 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
                 uint256 timeElapsed = endTime - lastRewardTime;
                 uint256 reward = timeElapsed * rewardRate;
                 
-                for (uint8 i = 0; i < levels.length; i++) {
+                for (uint8 i = 0; i < numLevels; i++) {
                     if (levels[i].totalStaked > 0) {
-                        uint256 levelBoostedStake = (uint256(levels[i].totalStaked) * levels[i].boostP) / 1e10;
+                        uint256 levelBoostedStake = (uint256(levels[i].totalStaked) * levels[i].boostP) / BOOST_PRECISION;
+                        // slither-disable-next-line divide-before-multiply
                         uint256 levelReward = (reward * levelBoostedStake) / totalBoostedStake;
-                        simAccRewardPerShare[i] += (levelReward * 1e18) / levels[i].totalStaked;
+                        // slither-disable-next-line divide-before-multiply
+                        simAccRewardPerShare[i] += (levelReward * ACC_PRECISION) / levels[i].totalStaked;
                     }
                 }
             }
         }
         
         // Calculate pending with simulated accRewardPerShare
-        uint256 total;
+        uint256 total = 0;
         uint64 stakeCount = users[_user].stakeIndex;
         
         for (uint64 i = 0; i < stakeCount;) {
             Stake storage s = stakeInfo[_user][i];
             if (!s.unstaked && block.timestamp >= s.rewardStartTime && s.stakedDexy > 0) {
                 uint256 accReward = simAccRewardPerShare[s.level];
-                total += (uint256(s.stakedDexy) * accReward / 1e18) - s.rewardDebt;
+                total += (uint256(s.stakedDexy) * accReward / ACC_PRECISION) - s.rewardDebt;
             }
             unchecked { i++; }
         }
@@ -439,11 +455,14 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
         uint256 reward = timeElapsed * rewardRate;
 
         // Distribute to each level proportionally
-        for (uint8 i = 0; i < levels.length;) {
+        uint256 numLevels = levels.length;
+        for (uint8 i = 0; i < numLevels;) {
             if (levels[i].totalStaked > 0) {
-                uint256 levelBoostedStake = (uint256(levels[i].totalStaked) * levels[i].boostP) / 1e10;
+                uint256 levelBoostedStake = (uint256(levels[i].totalStaked) * levels[i].boostP) / BOOST_PRECISION;
+                // slither-disable-next-line divide-before-multiply
                 uint256 levelReward = (reward * levelBoostedStake) / totalBoostedStake;
-                accRewardPerShare[i] += (levelReward * 1e18) / levels[i].totalStaked;
+                // slither-disable-next-line divide-before-multiply
+                accRewardPerShare[i] += (levelReward * ACC_PRECISION) / levels[i].totalStaked;
             }
             unchecked { i++; }
         }
@@ -460,6 +479,20 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
         return uint40(I_GENESIS_EPOCH_TIMESTAMP + uint256(currentEpoch + 1) * epochDuration);
     }
 
+    /**
+     * @dev Recalculates totalBoostedStake from level totals to avoid rounding error accumulation
+     * @notice This is O(numLevels) where numLevels is set at deployment and immutable thereafter
+     */
+    function _recalculateTotalBoostedStake() private {
+        uint256 total = 0;
+        uint256 numLevels = levels.length;
+        for (uint256 i = 0; i < numLevels;) {
+            total += (uint256(levels[i].totalStaked) * levels[i].boostP) / BOOST_PRECISION;
+            unchecked { i++; }
+        }
+        totalBoostedStake = total;
+    }
+
     // Manage parameters
     /**
      * @dev Validates level boost configuration
@@ -467,16 +500,25 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
      */
     function _checkboostP(Level[] memory _levels) private pure {
         // Level format [lockingPeriod, boostP]
-        bool failed;
-        uint256 totalBoost;
+        uint256 totalBoost = 0;
         uint256 numLevels = _levels.length;
+        
         for (uint256 i = 0; i < numLevels;) {
-            if ((i < numLevels - 1) && (!((_levels[i].lockingPeriod < _levels[i + 1].lockingPeriod) && (_levels[i].boostP < _levels[i + 1].boostP)))) failed = true;
+            // Check ordering with next level (if not the last one)
+            if (i < numLevels - 1) {
+                Level memory current = _levels[i];
+                Level memory next = _levels[i + 1];
+                
+                // Must be strictly increasing
+                if (current.lockingPeriod >= next.lockingPeriod) revert WrongValues();
+                if (current.boostP >= next.boostP) revert WrongValues();
+            }
+            
             totalBoost += _levels[i].boostP;
             unchecked { i++; }
         }
-        if (totalBoost != numLevels * 1e10) revert BoostSumNotRight();
-        if (failed) revert WrongValues();
+        
+        if (totalBoost != numLevels * BOOST_PRECISION) revert BoostSumNotRight();
     }
 
     /**
@@ -484,6 +526,7 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
      * @param _newContract Address of the new contract
      */
     function requestMigration(address _newContract) external onlyOwner {
+        if (_newContract == address(0)) revert AddressZero();
         if (migrationRequestTime != 0) revert MigrationAlreadyPending();
         pendingMigrationAddress = _newContract;
         migrationRequestTime = uint32(block.timestamp);
@@ -503,16 +546,22 @@ contract DexynthStakingV1 is Ownable, ReentrancyGuard {
     /**
      * @notice Execute migration after timelock expires
      */
-    function executeMigration() external onlyOwner {
+    function executeMigration() external nonReentrant onlyOwner {
         if (migrationRequestTime == 0) revert NoMigrationRequested();
         if (block.timestamp < migrationRequestTime + MIGRATION_DELAY) revert TimelockStillActive();
+        
         uint256 usdtBalance = IERC20(REWARD_TOKEN).balanceOf(address(this));
         uint256 dexyBalance = IERC20(DEXY).balanceOf(address(this));
         address migrationAddress = pendingMigrationAddress;
-        IERC20(REWARD_TOKEN).safeTransfer(migrationAddress, usdtBalance);
-        IERC20(DEXY).safeTransfer(migrationAddress, dexyBalance);
+        
+        // Effects
         pendingMigrationAddress = address(0);
         migrationRequestTime = 0;
+        
+        // Interactions
+        IERC20(REWARD_TOKEN).safeTransfer(migrationAddress, usdtBalance);
+        IERC20(DEXY).safeTransfer(migrationAddress, dexyBalance);
+        
         emit RewardTokenMigrationSuccess(usdtBalance, migrationAddress);
         emit DEXYMigrationSuccess(dexyBalance, migrationAddress);
     }

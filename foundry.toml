@@ -8,4 +8,9 @@ remappings = [
 ]
 via_ir = true
 
+[invariant]
+runs = 256             # Number of invariant test runs
+depth = 32             # Number of calls per run
+fail_on_revert = false # Don't fail if handler reverts (we handle gracefully)
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
